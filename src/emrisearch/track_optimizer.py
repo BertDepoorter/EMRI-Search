@@ -481,6 +481,37 @@ class TrackOptimizerJAX:
         )
         self.scaler = ParameterScaler(self.bounds)
 
+        # Trajectory resolution: 3 dense-steps per SFT segment ensures the
+        # cubic interpolation error is well below the STFT bin width 1/T_sft.
+        self._dense_steps: int = max(500, 3 * len(self.t_obs))
+
+    # ------------------------------------------------------------------
+    # Unconstrained parametrisation helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _to_unconstrained_np(theta_phys: np.ndarray,
+                              bounds: np.ndarray) -> np.ndarray:
+        """Map physical parameters [lo, hi]^5 → R^5 via the logit transform.
+
+        Inverse of the sigmoid transform used inside the JAX loss.
+
+        Parameters
+        ----------
+        theta_phys : array, shape (5,)
+            Physical parameters ``[M, mu, a, T_plunge, e_f]``.
+        bounds : array, shape (5, 2)
+            Parameter bounds ``[[lo, hi], ...]``.
+
+        Returns
+        -------
+        raw : array, shape (5,)  unconstrained parameters.
+        """
+        lo, hi = bounds[:, 0], bounds[:, 1]
+        u = (theta_phys - lo) / (hi - lo)
+        u = np.clip(u, 1e-6, 1.0 - 1e-6)
+        return np.log(u / (1.0 - u))  # logit
+
     def _build_loss(self, mode: tuple):
         """Return a JAX-compilable loss function for the given mode (m, k, n)."""
         jax = self._jax
@@ -494,6 +525,8 @@ class TrackOptimizerJAX:
         f_obs = self.f_obs
         t_obs = self.t_obs
         m, k, n = mode if len(mode) == 3 else (mode[0], 0, mode[1])
+        # Capture as Python int so diffrax can use it as a static shape argument
+        _dense_steps = self._dense_steps
 
         @jax.jit
         def loss(theta):
@@ -510,7 +543,7 @@ class TrackOptimizerJAX:
                 mu=mu,
                 backward=True,
                 e_f=e_f,
-                dense_steps=200,
+                dense_steps=_dense_steps,
             )
 
             # Frequency track along the trajectory
@@ -536,6 +569,116 @@ class TrackOptimizerJAX:
             return jnp.sum((f_pred - f_obs) ** 2)
 
         return loss
+
+    def _build_loss_raw(self, mode: tuple):
+        """Track-residual loss in unconstrained (logit) parameter space.
+
+        Wraps :meth:`_build_loss` with a sigmoid reparametrisation so that
+        gradient steps in ℝ⁵ automatically satisfy the physical bounds without
+        clipping.  Used internally by :meth:`optimize_adam`.
+
+        Parameters
+        ----------
+        mode : tuple (m, n) or (m, k, n)
+
+        Returns
+        -------
+        loss_raw : callable
+            ``loss_raw(raw_theta)`` where ``raw_theta ∈ ℝ^5``.
+        """
+        import jax
+        import jax.numpy as jnp
+
+        loss_phys = self._build_loss(mode)
+        lo = jnp.array(self.bounds[:, 0], dtype=jnp.float64)
+        hi = jnp.array(self.bounds[:, 1], dtype=jnp.float64)
+
+        @jax.jit
+        def loss_raw(raw_theta):
+            theta = lo + (hi - lo) * jax.nn.sigmoid(raw_theta)
+            return loss_phys(theta)
+
+        return loss_raw
+
+    def _build_joint_loss_raw(
+        self,
+        modes_list: list,
+        f_obs_list: list,
+        t_obs_list: list,
+    ):
+        """Joint track-residual loss over multiple confirmed modes.
+
+        Integrates the trajectory **once** per function call and evaluates
+        each mode's frequency track from the shared ``(p, e)`` output.
+
+        Parameters
+        ----------
+        modes_list : list of (m, n) or (m, k, n) tuples
+        f_obs_list : list of np.ndarray, each shape (n_sft_j,)
+            Observed frequencies for each mode.
+        t_obs_list : list of np.ndarray, each shape (n_sft_j,)
+            SFT mid-times for each mode.
+
+        Returns
+        -------
+        joint_loss : callable
+            ``joint_loss(raw_theta)`` where ``raw_theta ∈ ℝ^5``.
+        """
+        import jax
+        import jax.numpy as jnp
+        from fewtrax.trajectory import EMRIInspiral
+        from fewtrax.utils.geodesic import get_fundamental_frequencies
+        from fewtrax.utils.constants import YEAR_SI, MTSUN_SI
+
+        traj = EMRIInspiral(self.flux_data)
+        _dense_steps = self._dense_steps
+        lo = jnp.array(self.bounds[:, 0], dtype=jnp.float64)
+        hi = jnp.array(self.bounds[:, 1], dtype=jnp.float64)
+
+        # Parse mode numbers: (m, k, n) for each mode
+        mkn_list = [
+            (md[0], md[1], md[2]) if len(md) == 3 else (md[0], 0, md[1])
+            for md in modes_list
+        ]
+        # Convert observed tracks to JAX arrays once (captured in closure)
+        f_obs_jax = [jnp.array(f, dtype=jnp.float64) for f in f_obs_list]
+        t_obs_jax = [jnp.array(t, dtype=jnp.float64) for t in t_obs_list]
+
+        @jax.jit
+        def joint_loss(raw_theta):
+            theta = lo + (hi - lo) * jax.nn.sigmoid(raw_theta)
+            M, mu, a, T_plunge, e_f = (
+                theta[0], theta[1], theta[2], theta[3], theta[4]
+            )
+
+            # Single trajectory integration shared across all modes
+            t_back, p_back, e_back, _, _, _ = traj(
+                p0=jnp.float64(10.0),
+                e0=e_f, T=T_plunge, a=a, M=M, mu=mu,
+                backward=True, e_f=e_f,
+                dense_steps=_dense_steps,
+            )
+            M_total_s = (M + mu) * MTSUN_SI
+            T_plunge_s = T_plunge * YEAR_SI
+
+            total = jnp.float64(0.0)
+            for (m, k, n), f_obs, t_obs in zip(mkn_list, f_obs_jax, t_obs_jax):
+                def freq_one(p, e, _m=m, _k=k, _n=n):
+                    Om_phi, Om_theta, Om_r = get_fundamental_frequencies(
+                        jnp.abs(a), p, e, 1.0
+                    )
+                    return jnp.abs(
+                        _m * Om_phi + _k * Om_theta + _n * Om_r
+                    ) / (2.0 * jnp.pi * M_total_s)
+
+                f_track = jax.vmap(freq_one)(p_back, e_back)
+                tau_obs = T_plunge_s - t_obs
+                f_pred = jnp.interp(tau_obs, t_back, f_track)
+                total = total + jnp.sum((f_pred - f_obs) ** 2)
+
+            return total
+
+        return joint_loss
 
     def optimize_adam(self,
                       mode: tuple = (2, 0),
@@ -569,37 +712,41 @@ class TrackOptimizerJAX:
         import jax.numpy as jnp
         import optax
 
-        loss_fn = self._build_loss(mode)
+        # Use unconstrained parametrisation (sigmoid transform) to avoid
+        # boundary gradient zeroing from clipping.
+        loss_raw = self._build_loss_raw(mode)
+        loss_fn  = self._build_loss(mode)   # physical space, for final eval
         optimizer = optax.adam(learning_rate=learning_rate)
+        lo = jnp.array(self.bounds[:, 0], dtype=jnp.float64)
+        hi = jnp.array(self.bounds[:, 1], dtype=jnp.float64)
 
         @jax.jit
-        def step(theta, opt_state):
-            loss_val, grads = jax.value_and_grad(loss_fn)(theta)
+        def step(raw_theta, opt_state):
+            loss_val, grads = jax.value_and_grad(loss_raw)(raw_theta)
             updates, new_state = optimizer.update(grads, opt_state)
-            new_theta = optax.apply_updates(theta, updates)
-            # Clip to bounds
-            lower = jnp.array(self.bounds[:, 0])
-            upper = jnp.array(self.bounds[:, 1])
-            new_theta = jnp.clip(new_theta, lower, upper)
-            return new_theta, new_state, loss_val
+            new_raw = optax.apply_updates(raw_theta, updates)
+            return new_raw, new_state, loss_val
 
         scaler = ParameterScaler(self.bounds, seed=seed)
-        init_params = scaler.draw_samples(n_starts)
+        init_params_phys = scaler.draw_samples(n_starts)
 
         best_loss = np.inf
-        best_params = init_params[0].copy()
+        best_params = init_params_phys[0].copy()
 
-        for params_init in init_params:
-            theta = jnp.array(params_init, dtype=jnp.float64)
-            opt_state = optimizer.init(theta)
+        for params_phys in init_params_phys:
+            raw_init = TrackOptimizerJAX._to_unconstrained_np(params_phys, self.bounds)
+            raw_theta = jnp.array(raw_init, dtype=jnp.float64)
+            opt_state = optimizer.init(raw_theta)
 
             for _ in range(n_steps):
-                theta, opt_state, loss_val = step(theta, opt_state)
+                raw_theta, opt_state, _ = step(raw_theta, opt_state)
 
-            final_loss = float(loss_fn(theta))
+            # Convert back to physical space for final loss evaluation
+            theta_phys = np.array(lo + (hi - lo) * jax.nn.sigmoid(raw_theta))
+            final_loss = float(loss_fn(jnp.array(theta_phys, dtype=jnp.float64)))
             if final_loss < best_loss:
                 best_loss = final_loss
-                best_params = np.array(theta)
+                best_params = theta_phys.copy()
 
         return best_params, best_loss
 
@@ -709,6 +856,7 @@ class TrackOptimizerJAX:
         traj = EMRIInspiral(self.flux_data)
         t_obs = self.t_obs
         m, k, n = mode if len(mode) == 3 else (mode[0], 0, mode[1])
+        _dense_steps = self._dense_steps  # Python int for static JIT argument
 
         @jax.jit
         def predict_freqs(theta):
@@ -717,7 +865,8 @@ class TrackOptimizerJAX:
             )
             t_back, p_back, e_back, _, _, _ = traj(
                 p0=jnp.float64(10.0), e0=e_f, T=T_plunge,
-                a=a, M=M, mu=mu, backward=True, e_f=e_f, dense_steps=200,
+                a=a, M=M, mu=mu, backward=True, e_f=e_f,
+                dense_steps=_dense_steps,
             )
             M_total_s = (M + mu) * MTSUN_SI
 
