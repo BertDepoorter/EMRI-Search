@@ -43,6 +43,7 @@ dependencies = [
     "lisaanalysistools==1.2.6",
     "gpubackendtools>=0.0.18",
     "fastlisaresponse>=1.1.17",
+    "ipykernel>=6.31.0",
 ]
 
 [project.urls]
