@@ -5,8 +5,9 @@ This module provides:
 
 :class:`FastEMRILikelihood`
     Matched-filter log-likelihood using ``fastemriwaveforms``
-    (GPU-accelerated FEW with cupy-cuda12x) and ``fastlisaresponse``
-    for LISA TDI channel generation.
+    (GPU-accelerated FEW with cupy-cuda12x) and ``lisatools.response``
+    (the LISA TDI response, formerly ``fastlisaresponse``) for LISA TDI
+    channel generation.
 
 :func:`prepare_mcmc_handoff`
     Convert a :class:`~emrisearch.iterative_track_search.SearchResult`
@@ -26,7 +27,7 @@ Pipeline
     from emrisearch.mcmc_likelihood import FastEMRILikelihood, prepare_mcmc_handoff
     handoff = prepare_mcmc_handoff(result)
 
-    # 3. Build likelihood (requires fastemriwaveforms + fastlisaresponse + cupy)
+    # 3. Build likelihood (requires fastemriwaveforms + lisaanalysistools + cupy)
     like = FastEMRILikelihood(data_td_A, data_td_E, T_data, dt)
     log_like = like(params)  # params = handoff.param_vector_from_physical(...)
 
@@ -341,11 +342,11 @@ def prepare_mcmc_handoff(
 # ---------------------------------------------------------------------------
 
 class FastEMRILikelihood:
-    """Full matched-filter EMRI log-likelihood using fastemriwaveforms + fastlisaresponse.
+    """Full matched-filter EMRI log-likelihood using fastemriwaveforms + lisatools.response.
 
     Requires:
     - ``fastemriwaveforms`` (FEW with cupy-cuda12x GPU backend)
-    - ``fastlisaresponse``
+    - ``lisaanalysistools`` (``lisatools.response``, formerly ``fastlisaresponse``)
     - ``cupy-cuda12x``
 
     Parameter vector convention
@@ -431,14 +432,16 @@ class FastEMRILikelihood:
             return False
 
     def _build_response(self, wf_kw: dict, resp_kw: dict):
-        """Construct FEW + fastlisaresponse pipeline."""
+        """Construct FEW + lisatools.response pipeline."""
         try:
             from few.waveform import FastKerrEccentricEquatorialFlux
-            from fastlisaresponse import ResponseWrapper
+            # fastlisaresponse has been absorbed into lisatools; the generic
+            # LISA response/TDI now lives in lisatools.response.
+            from lisatools.response import ResponseWrapper
         except ImportError as exc:
             raise ImportError(
-                "FastEMRILikelihood requires fastemriwaveforms and fastlisaresponse.\n"
-                "Install with: pip install fastemriwaveforms fastlisaresponse"
+                "FastEMRILikelihood requires fastemriwaveforms and lisaanalysistools.\n"
+                "Install with: pip install fastemriwaveforms lisaanalysistools"
             ) from exc
 
         wf_gen = FastKerrEccentricEquatorialFlux(
@@ -452,15 +455,20 @@ class FastEMRILikelihood:
         #   Phi_phi0, Phi_theta0, Phi_r0] vector → indices 7 and 8 are 0-based
         #   into the full param vector but fastlisaresponse expects them after
         #   removing log transforms, so index_lambda=7, index_beta=8).
+        # fastlisaresponse -> lisatools.response migration:
+        #   * ``use_gpu=`` is gone; backend is selected via ``force_backend``
+        #     ("cpu"/"cuda11x"/"cuda12x"/"cuda13x", or None to auto-detect).
+        #   * the old ``t0`` (garbage buffer) split into ``t0`` (epoch start)
+        #     and ``t_buffer`` (garbage buffer, kept at its working default).
         response = ResponseWrapper(
             wf_gen,
             T_s,
             self._dt,
             index_lambda=7,    # phiS index in [M,mu,a,p0,e0,x0,d_L,qS,phiS,...]
             index_beta=8,      # qS index
-            t0=resp_kw.pop("t0", 100.0 * self._dt),
+            t0=resp_kw.pop("t0", 10000.0),
             flip_hx=True,
-            use_gpu=self._use_gpu,
+            force_backend=None if self._use_gpu else "cpu",
             remove_sky_coords=True,
             is_ecliptic_latitude=False,  # qS is colatitude
             remove_garbage=True,

@@ -1,4 +1,7 @@
 import numpy as np
+# fastlisaresponse has been absorbed into lisatools; the generic LISA
+# response/TDI now lives in lisatools.response (directresponse.py).
+from lisatools.response import ResponseWrapper
 import few
 from few.trajectory.inspiral import EMRIInspiral
 from few.utils.constants import YRSID_SI
@@ -6,7 +9,7 @@ from few.trajectory.ode import KerrEccEqFlux
 from few.utils.geodesic import get_separatrix
 from few.waveform import GenerateEMRIWaveform
 from lisatools.detector import EqualArmlengthOrbits
-from fastlisaresponse import ResponseWrapper
+
 
 # Initialize trajectory and waveform generators
 traj = EMRIInspiral(func=KerrEccEqFlux)
@@ -34,25 +37,32 @@ def get_response_generator(T, dt, waveform_model="FastKerrEccentricEquatorialFlu
 
     use_gpu = few.has_backend('gpu')
     tdi_gen = "2nd generation"
+    # NOTE (fastlisaresponse -> lisatools.response migration):
+    # The old fastlisaresponse `t0` kwarg (the garbage buffer) was split into
+    # two kwargs in lisatools.response.ResponseWrapper:
+    #   * ``t0``       -- initial/epoch time at which to start the waveform.
+    #   * ``t_buffer`` -- garbage buffer removed/zeroed at both ends.
+    # ``t_buffer`` must stay large enough (a few thousand seconds) or
+    # ``get_projections`` raises "Need to increase t_buffer"; we keep its
+    # default (10000.0) and set the epoch offset to t0=10000.0.
     tdi_kwargs_esa = dict(
-        t0=30000.0,
         order=25,
         tdi=tdi_gen,
         tdi_chan="AET",
         orbits=EqualArmlengthOrbits(),
         )
 
-    # with longer signals we care less about this
-    t0 = 10000.0  # throw away on both ends when our orbital information is weird
     wave_gen = ResponseWrapper(
         few_gen,
         T,
         dt,
         index_lambda=8,
         index_beta=7,
+        t0=10000.0,
         flip_hx=True,  # set to True if waveform is h+ - ihx (FEW is)
         is_ecliptic_latitude=False,  # False if using polar angle (theta)
         remove_garbage='zero',  # removes the beginning of the signal that has bad information
+        force_backend=None if use_gpu else "cpu",
         **tdi_kwargs_esa,
     )
     return wave_gen
@@ -227,7 +237,7 @@ def create_signal(params,
         Phi_theta0=np.random.uniform(0,2*np.pi)
         Phi_r0=np.random.uniform(0,2*np.pi)
 
-    m1, m2, a, Tpl, ef, x0 = params.T
+    m1, m2, a, Tpl, ef, x0 = params
     p_f = traj.inspiral_generator.func.separatrix_buffer_dist + get_separatrix(a, ef, 1.0) + 1e-6
     backwards_result = traj(m1, m2, a, p_f, ef, x0, T=Tpl, integrate_backwards=True)
     p0_true = backwards_result[1][-1]
