@@ -1,3 +1,4 @@
+.env
 src/emrisearch.egg-info/
 src/emrisearch/__pycache__/
 .ipynb_checkpoints/
